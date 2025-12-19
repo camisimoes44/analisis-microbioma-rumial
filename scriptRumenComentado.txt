@@ -1,0 +1,795 @@
+##############################################################################
+# 0. Preparación inicial
+##############################################################################
+
+# Definir el directorio de trabajo donde están los FASTQ
+path <- "."
+
+# NOTA: asegúrate de ejecutar setwd("...") si tu proyecto está en otra carpeta.
+# Por ejemplo: setwd("~/proyectos/rumen/")
+# Mantener el path relativo "." facilita portar el script.
+
+
+##############################################################################
+# 1. Lectura de nombres de archivos FASTQ pareados (forward / reverse)
+##############################################################################
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_1.fastq.gz and SAMPLENAME_2.fastq.gz
+
+# Buscamos todos los archivos que empiecen con '..._1.fastq.gz' y '..._2.fastq.gz'
+fnFs <- sort(list.files(path, pattern = "_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_2.fastq.gz", full.names = TRUE))
+
+# Extraer sample names: partimos del nombre de los archivos *forward* y quitamos el sufijo "_1..."
+# Asumimos formato SAMPLENAME_1.fastq.gz
+sample.names <- sapply(strsplit(basename(fnFs), "_1"), `[`, 1)
+
+# Chequeos rápidos: mismo número de archivos forward/reverse
+if(length(fnFs) != length(fnRs)) stop("Número distinto de archivos forward y reverse. Revisa tus fastq.")
+
+
+##############################################################################
+# 2. Inspección de calidad — perfiles de calidad (DADA2)
+##############################################################################
+
+# Generamos un PDF con los perfiles de calidad de las primeras 2 muestras
+# Esto ayuda a decidir parámetros de truncado y filtrado (truncLen, maxEE, truncQ, etc.)
+pdf("qualities.pdf")
+  plotQualityProfile(fnFs[1:2])
+  plotQualityProfile(fnRs[1:2])
+dev.off()
+
+# -> Revisa qualities.pdf y adapta truncQ/truncLen/maxEE según la caída de calidad
+#    típica en tus lecturas. No uses un truncLen si no estás seguro; en DADA2
+#    truncQ=2 y maxEE=c(2,2) es una opción conservadora.
+
+
+##############################################################################
+# 3. Filtrado de lecturas (filterAndTrim)
+##############################################################################
+
+# Creamos una carpeta 'filtered' (si no existe) y nombramos los fastq filtrados
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# Ejecutamos filterAndTrim con parámetros recomendados (puedes ajustar según profiles)
+# - maxN=0: eliminar lecturas con Ns
+# - maxEE: número esperado de errores (más robusto que calidad media)
+# - truncQ: truncar cuando la calidad cae a <= 2
+# - rm.phix: eliminar lecturas de control PhiX
+# - compress: gzip salida
+# - multithread: TRUE si tu sistema lo permite
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE,
+                     compress = TRUE, multithread = TRUE) # On Windows set multithread=FALSE
+
+# Mostrar un resumen por muestra: cuántas lecturas entraron y cuántas quedaron
+head(out)
+
+# Nota para publicación: reportar la tabla 'out' / o exportarla como TSV para el método y reproducibilidad.
+
+
+##############################################################################
+# 4. Aprendizaje de errores y denoising (DADA2)
+##############################################################################
+
+# Estimamos modelos de error a partir de los fastq filtrados
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+# Guardamos plots de errores para inspección
+pdf("plotErrors.pdf")
+  plotErrors(errF, nominalQ = TRUE)
+  plotErrors(errR, nominalQ = TRUE)
+dev.off()
+
+# Ejecutamos dada() para denoising — produce objetos con las secuencias ASV y abundancias
+dadaFs <- dada(filtFs, err = errF, multithread = TRUE)/Users/csimoes/Downloads/analisisCH4media2025.R
+dadaRs <- dada(filtRs, err = errR, multithread = TRUE)
+
+# Nota: revisar plots/diagnósticos de errF / errR — modelos apropiados reducen falsos positivos.
+
+
+##############################################################################
+# 5. Merge pares, tabla de secuencias y remoción de quimeras
+##############################################################################
+
+# Unimos lecturas forward y reverse en pares (mergePairs)
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+# Inspección rápida del resultado del merge en la primera muestra
+head(mergers[[1]])
+
+# Construimos la tabla de secuencias (samples x ASVs)
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)  # filas = muestras, columnas = ASVs
+
+# Distribución de longitudes (útil para detectar artefactos/amplicones inesperados)
+table(nchar(getSequences(seqtab)))
+
+# Remover quimeras (removeBimeraDenovo) — método "consensus" es robusto para conjuntos de muestras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim)
+
+# Nota para publicación: reportar número de ASVs antes/después de quitar quimeras y justificar parámetros.
+
+
+##############################################################################
+# 6. Tracking de lecturas a través del pipeline
+##############################################################################
+
+# Función para contar lecturas únicas (útil para track)
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(out,
+               sapply(dadaFs, getN),
+               sapply(dadaRs, getN),
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim))
+
+# Nombre de columnas consistentes con etapas del pipeline
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+# Guardar el tracking a disco; ideal para un anexo en el paper
+write.table(track, "track_rumen.txt", sep = "\t", quote = FALSE, col.names = TRUE, row.names = TRUE)
+
+
+##############################################################################
+# 7. Asignación taxonómica (SILVA con DADA2)
+##############################################################################
+
+# Asignar taxonomía usando el train set de SILVA (usar la versión exacta que cites)
+taxa <- assignTaxonomy(seqtab.nochim,
+                       "./silva_nr99_v138.1_wSpecies_train_set.fa.gz",
+                       multithread = TRUE)
+
+# Nota: en publicaciones indicar la versión y la fuente del banco SILVA exacto.
+
+
+##############################################################################
+# 8. Construcción del objeto phyloseq
+##############################################################################
+
+# Cargar paquetes necesarios (verificar versiones para reproducibilidad)
+library(Biostrings); packageVersion("Biostrings")
+library(ggplot2); packageVersion("ggplot2")
+library(phyloseq)
+
+# Aseguramos que las filas de la tabla de conteos estén nombradas por sample.names
+rownames(seqtab.nochim) <- sample.names
+
+# Construcción de metadatos simple a partir del nombre de la muestra
+# Se asume que sample.names tiene formato: "cow_date_sampleType" (separa por "_")
+info <- matrix(unlist(strsplit(sample.names, "_")), ncol = 3, byrow = TRUE)
+samdf <- data.frame(sample = sample.names, cow = info[,1], date = info[,2], sampleType = info[,3])
+rownames(samdf) <- sample.names
+
+# Homogeneizar nombres de taxones si se desea (a mayúsculas para rownames)
+rownames(taxa) <- lapply(rownames(taxa), toupper)
+
+# Construimos la OTU table (phyloseq espera muestras en filas si taxa_are_rows=FALSE)
+otuTable <- otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+rownames(otuTable) <- sample.names
+
+# Crear objeto phyloseq con OTU table, metadatos y tabla taxonómica
+ps <- phyloseq(otuTable, sample_data(samdf), tax_table(taxa))
+
+# Guardar las secuencias como refseq para evitar tener secuencias largas como rownames
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+
+# Renombrar ASVs a etiquetas legibles: ASV1, ASV2, ...
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+# Mostrar resumen del objeto phyloseq
+ps
+
+# Guardar objeto en formato RData para uso posterior
+save(ps, file = "ps.rumen")
+
+
+##############################################################################
+# 9. Carga de paquetes para análisis posteriores
+##############################################################################
+
+# Librerías para visualización y análisis (revisar versiones)
+library(ampvis2)
+library(mia)
+library(miaViz)
+library(ANCOMBC)
+library(tidyr)
+library(patchwork)
+library(ggsignif)
+library(scater)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+
+# Nota: listar versiones de paquetes en la sección de métodos del artículo.
+
+
+##############################################################################
+# 10. Preparar workspace: mover al subdirectorio y cargar objeto
+##############################################################################
+
+setwd("rumen")    # cambiar si usas otra organización
+load("ps.rumen")  # cargar phyloseq creado arriba
+
+
+##############################################################################
+# 11. Añadir metadatos externos (archivo 'datos_rumen.txt')
+##############################################################################
+
+library(readxl)
+library(phyloseq)
+
+# Cargar tabla de metadatos (asegúrate de que la columna 'sample' coincida exactamente con rownames)
+datos_rumen <- read.table("datos_rumen.txt", sep = "\t", header = TRUE)
+
+# Generamos un objeto auxiliar con la lista de muestras del phyloseq y mergemos con los metadatos
+aux <- data.frame(sample = rownames(otu_table(ps)))
+aux <- merge(aux, datos_rumen, by = "sample")
+aux <- sample_data(aux)
+rownames(aux) <- aux$sample
+
+# Re-asignar sample_data en el phyloseq con metadatos enriquecidos
+sample_data(ps) <- aux
+
+# Nota: en el manuscript mencionar cómo se generaron y verificaron los metadatos (control de calidad).
+
+
+##############################################################################
+# 12. ANÁLISIS A NIVEL DE ASVs (exploratorio y ranking)
+##############################################################################
+
+# Usamos 'obj' como alias para ps
+obj <- ps
+
+# ampvis2 requiere la tabla de OTU con filas = features. Por eso transponemos.
+t(otu_table(obj)) -> otu_table(obj)
+
+# Construimos tabla con OTU, conteos y taxonomía para ampvis2
+otutable <- data.frame(OTU = rownames(phyloseq::otu_table(obj)@.Data),
+                       phyloseq::otu_table(obj)@.Data,
+                       phyloseq::tax_table(obj)@.Data,
+                       check.names = FALSE)
+
+# Extraemos la metadata (ampvis2 espera la primera columna como sample ID)
+metadata <- data.frame(phyloseq::sample_data(obj), check.names = FALSE)
+
+# ampvis2 requiere 7 niveles taxonómicos (Kingdom..Species). Si falta 'Species', duplicamos 'Genus'
+if (!"Species" %in% colnames(otutable) && "Genus" %in% colnames(otutable)) {
+  otutable$Species <- otutable$Genus
+}
+
+# Cargamos objeto ampvis2 con amp_load (permite gráficas de abundancia / rank)
+av2 <- amp_load(otutable, metadata)
+
+# Rank abundance plots por distintas variables experimentales
+amp_rankabundance(av2, group_by = "samplingDevice") + labs(title = "Sampling device")
+amp_rankabundance(av2, group_by = "samplingPoint") + labs(title = "days from Birth")
+amp_rankabundance(av2, group_by = "treatment") + labs(title = "Treatment")
+amp_rankabundance(av2, group_by = "cow") + labs(title = "Cow")
+
+# Nota: estas figuras son útiles para suplementos o para justificar filtros.
+
+
+##############################################################################
+# 13. ANÁLISIS POR GRUPOS TAXONÓMICOS (con mia)
+##############################################################################
+
+library(mia)
+
+# Convertimos phyloseq a TreeSummarizedExperiment (TSE) via mia
+tse <- convertFromPhyloseq(ps)
+
+# Filtrado por prevalencia de ASVs (opcional, evita features ultra raros). Aquí se usa prevalence=0.05 y detection=1.
+tse <- subsetByPrevalent(tse, prevalence = 0.05, detection = 1, as.relative = FALSE)
+
+# Convertir samplingPoint a carácter para ciertas operaciones
+colData(tse)$samplingPoint <- as.character(colData(tse)$samplingPoint)
+
+# Obtener abundancias relativas (útil para comparaciones y visualizaciones)
+tse <- transformAssay(tse, method = "relabundance")
+
+# Añadir árbol jerárquico de taxonomía (necesario para algunas funciones de mia)
+tse <- addHierarchyTree(tse)
+
+# Exportar tablas crudas y relativas si se desean compartir en repositorio
+write.table(assay(tse, "counts"), file = "conteos_ASVs.txt", sep = "\t", quote = FALSE, col.names = NA)
+write.table(assay(tse, "relabundance"), file = "abundanciaRel_ASVs.txt", sep = "\t", quote = FALSE, col.names = NA)
+
+
+##############################################################################
+# 14. Curvas de rarefacción y riqueza de ASVs
+##############################################################################
+
+# Extraemos la matriz de conteos para rarefaction curves
+count_matrix <- assay(tse, "counts")
+
+library(vegan)
+rarecurve(count_matrix, step = 1, label = TRUE, cex = 0.5)
+
+# Conteo de ASVs por muestra y estadísticos resumen
+asv_per_sample <- apply(counts(tse), 2, function(x) sum(x > 0))
+asv_summary <- c(min = min(asv_per_sample), mean = mean(asv_per_sample), max = max(asv_per_sample))
+print(asv_summary)
+
+
+##############################################################################
+# 15. Porcentaje de lecturas clasificadas a distintos niveles taxonómicos
+##############################################################################
+
+# Calculamos la fracción de abundancia que quedó sin asignar en cada rango taxonómico
+# 1 - mean(colSums(relabundance de los features NA en ese nivel))  => fracción asignada
+prop_assigned <- c(
+  Kingdom = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Kingdom), ]), 2, sum)),
+  Phylum  = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Phylum), ]), 2, sum)),
+  Class   = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Class), ]), 2, sum)),
+  Order   = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Order), ]), 2, sum)),
+  Family  = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Family), ]), 2, sum)),
+  Genus   = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Genus), ]), 2, sum)),
+  Species = 1 - mean(apply(relabundance(tse[is.na(rowData(tse)$Species), ]), 2, sum))
+)
+print(prop_assigned)
+
+# Número de categorias observadas en cada nivel
+n_taxa_levels <- c(
+  Kingdom = length(unique(rowData(tse)$Kingdom)),
+  Phylum  = length(unique(rowData(tse)$Phylum)),
+  Class   = length(unique(rowData(tse)$Class)),
+  Order   = length(unique(rowData(tse)$Order)),
+  Family  = length(unique(rowData(tse)$Family)),
+  Genus   = length(unique(rowData(tse)$Genus))
+)
+print(n_taxa_levels)
+
+
+##############################################################################
+# 16. Diversidad alfa: índices y pruebas
+##############################################################################
+
+# Riqueza observada
+tse <- mia::addAlpha(tse, assay.type = "counts", index = "observed", name = "observed")
+
+# Índice de Shannon
+tse <- mia::addAlpha(tse, assay.type = "counts", index = "shannon",  name = "shannon")
+
+# Diversidad filogenética (Faith)
+tse <- mia::estimateFaith(tse, abund_values = "counts")
+
+# Uniformidad (Simpson)
+tse <- estimateEvenness(tse, assay.type = "counts", index = "simpson")
+
+# Dominancia relativa
+tse <- estimateDominance(tse, assay.type = "counts", index = "relative")
+
+# Rareza (log-modulo skewness)
+tse <- mia::estimateDiversity(tse, abund_values = "counts", index = "log_modulo_skewness")
+
+# Divergencia (distancia a la mediana por vegdist)
+tse <- mia::estimateDivergence(tse, abund_values = "counts", reference = "median", FUN = vegan::vegdist)
+
+# NOTA: documentar en métodos qué índices usaste y por qué (interpretación).
+
+
+##############################################################################
+# 17. Comparaciones no paramétricas (Wilcoxon) entre grupos
+##############################################################################
+
+# Identificadores de subgrupos (indices)
+sonda   <- which(colData(tse)$samplingDevice == "S")
+fistula <- which(colData(tse)$samplingDevice == "F")
+
+menos30 <- which(colData(tse)$samplingPoint == "-30")
+mas35   <- which(colData(tse)$samplingPoint == "35")
+mas65   <- which(colData(tse)$samplingPoint == "65")
+
+blue  <- which(colData(tse)$treatment == "blue")
+green <- which(colData(tse)$treatment == "green")
+red   <- which(colData(tse)$treatment == "red")
+
+# Tests Wilcoxon (no paramétricos) para riqueza observada y Shannon
+wilcox.test(colData(tse)$observed[sonda], colData(tse)$observed[fistula])
+
+wilcox.test(colData(tse)$observed[menos30], colData(tse)$observed[mas35])
+wilcox.test(colData(tse)$observed[menos30], colData(tse)$observed[mas65])
+wilcox.test(colData(tse)$observed[mas35], colData(tse)$observed[mas65])
+
+wilcox.test(colData(tse)$shannon[sonda], colData(tse)$shannon[fistula])
+
+# Nota metodológica: Wilcoxon compara medianas — comprueba supuestos y considera
+# ajustar p-values si haces muchas pruebas (FDR).
+
+
+##############################################################################
+# 18. Visualización de alfa-diversidad (boxplots, comparaciones)
+##############################################################################
+
+library(ggpubr)
+library(patchwork)
+
+# Boxplots por samplingPoint (observed y shannon) con comparaciones estadíst.
+observed_box <- ggplot(as.data.frame(colData(tse)),
+                       aes(x = samplingPoint, y = observed, fill = samplingPoint)) +
+  geom_boxplot() +
+  theme(title = element_text(size = 12)) +
+  scale_color_manual("Sampling point", labels = c("-30", "+35", "+65"),
+                     values = c("#80B1D3", "#FB8072", "gray")) +
+  scale_fill_manual("Sampling point", labels = c("-30", "+35", "+65"),
+                    values = c("#80B1D3", "#FB8072", "gray")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+shannon_box <- ggplot(as.data.frame(colData(tse)),
+                      aes(x = samplingPoint, y = shannon, fill = samplingPoint)) +
+  geom_boxplot() +
+  theme(title = element_text(size = 12)) +
+  scale_color_manual("Sampling point", labels = c("-30", "+35", "+65"),
+                     values = c("#80B1D3", "#FB8072", "gray")) +
+  scale_fill_manual("Sampling point", labels = c("-30", "+35", "+65"),
+                    values = c("#80B1D3", "#FB8072", "gray")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+# Añadimos comparaciones múltiples con stat_compare_means (ggpubr)
+shannon <- shannon_box +
+  stat_compare_means(comparisons = list(c("-30", "35"), c("35", "65"), c("-30", "65")),
+                     label = "p.signif",
+                     symnum.args = list(cutpoints = c(0, 0.05, 1), symbols = c("*", "n.s")))
+
+observed <- observed_box +
+  theme(legend.position = "none") +
+  stat_compare_means(comparisons = list(c("-30", "35"), c("35", "65"), c("-30", "65")),
+                     label = "p.signif",
+                     symnum.args = list(cutpoints = c(0, 0.05, 1), symbols = c("*", "n.s")))
+
+# Mostrar lado a lado
+observed + shannon + plot_layout(nrow = 1, widths = 1)
+
+
+# Boxplots por samplingDevice (F vs S)
+observed_box <- ggplot(as.data.frame(colData(tse)),
+                       aes(x = samplingDevice, y = observed, fill = samplingDevice)) +
+  geom_boxplot() +
+  theme(title = element_text(size = 12)) +
+  scale_color_manual("Sampling point", labels = c("F", "S"), values = c("#80B1D3", "#FB8072")) +
+  scale_fill_manual("Sampling point", labels = c("F", "S"), values = c("#80B1D3", "#FB8072")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+shannon_box <- ggplot(as.data.frame(colData(tse)),
+                      aes(x = samplingDevice, y = shannon, fill = samplingDevice)) +
+  geom_boxplot() +
+  theme(title = element_text(size = 12)) +
+  scale_color_manual("Sampling point", labels = c("F", "S"), values = c("#80B1D3", "#FB8072")) +
+  scale_fill_manual("Sampling point", labels = c("F", "S"), values = c("#80B1D3", "#FB8072")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+shannon <- shannon_box +
+  stat_compare_means(comparisons = list(c("F", "S")), label = "p.signif",
+                     symnum.args = list(cutpoints = c(0, 0.05, 1), symbols = c("*", "n.s")))
+
+observed <- observed_box +
+  theme(legend.position = "none") +
+  stat_compare_means(comparisons = list(c("F", "S")), label = "p.signif",
+                     symnum.args = list(cutpoints = c(0, 0.05, 1), symbols = c("*", "n.s")))
+
+observed + shannon + plot_layout(nrow = 1, widths = 1)
+
+
+##############################################################################
+# 19. Diversidad beta y ordenamientos (PCoA/NMDS/MDS) con scater/mia
+##############################################################################
+
+library(scater)
+# Correr PCoA con distancia Bray-Curtis (usando la matriz de counts)
+tse <- runMDS(tse, FUN = vegan::vegdist, method = "bray", name = "PCoA_BC", exprs_values = "counts")
+
+# MDS euclidiano
+tse <- runMDS(tse, FUN = vegan::vegdist, name = "MDS_euclidean", method = "euclidean", exprs_values = "counts")
+
+# NMDS (Bray)
+tse <- runNMDS(tse, FUN = vegan::vegdist, name = "NMDS_BC")
+
+# NMDS Euclidean (si se desea)
+tse <- runNMDS(tse, FUN = vegan::vegdist, name = "NMDS_euclidean", method = "euclidean")
+
+# Visualizar PCoA (usando plotReducedDim de scater/mia)
+p <- plotReducedDim(tse, "PCoA_BC") +
+  geom_point(size = 5, aes(color = colData(tse)$cow, shape = colData(tse)$samplingDevice))
+
+# Añadir % var explicada por los ejes (si la función lo provee)
+e <- attr(reducedDim(tse, "PCoA_BC"), "eig")
+rel_eig <- e / sum(e[e > 0])
+p <- p + labs(x = paste("PCoA 1 (", round(100 * rel_eig[[1]], 1), "%)", sep = ""),
+              y = paste("PCoA 2 (", round(100 * rel_eig[[2]], 1), "%)", sep = ""))
+print(p)
+
+# Carga de loadings si interesa interpretar vectores/ASVs que contribuyen
+plotLoadings(tse, "PCoA", ncomponents = 2, n = 20)
+
+
+##############################################################################
+# 20. RDA (dbRDA) y PERMANOVA (adonis2)
+##############################################################################
+
+# runRDA ya calcula la RDA y (en mia) guarda info de significancia
+tse <- runRDA(tse,
+              assay.type = "relabundance",
+              formula = assay ~ samplingPoint + samplingDevice + cow + treatment,
+              distance = "bray",
+              na.action = na.exclude)
+
+# Extraer resultados de PERMANOVA guardados en reducedDim
+rda_info <- attr(reducedDim(tse, "RDA"), "significance")
+rda_info$permanova |> knitr::kable()  # tabla bonita con knitr
+
+# plotLoadings para ver taxones que cargan en cada eje
+plotLoadings(tse, "RDA", ncomponents = 2, n = 20)
+plotRDA(tse, "RDA", colour.by = "samplingPoint")
+plotRDA(tse, "RDA", colour.by = "samplingDevice")
+
+
+##############################################################################
+# 21. Abundancia diferencial (prevalencia, filtrado y DESeq2 pareado)
+##############################################################################
+
+# Aglomerar por género conservando NAs
+tse_genus <- agglomerateByRank(tse, rank = "Genus")
+tse_genus_notNA <- tse_genus[!is.na(rowData(tse_genus)$Genus), ]
+
+# Estadísticas simples sobre presencia/ausencia por muestra
+apply(counts(tse_genus_notNA), 2, function(x) sum(x > 0))
+mean(apply(counts(tse_genus_notNA), 2, function(x) sum(x > 0)))
+max(apply(counts(tse_genus_notNA), 2, function(x) sum(x > 0)))
+min(apply(counts(tse_genus_notNA), 2, function(x) sum(x > 0)))
+
+# A partir de aquí hacemos filtrado por prevalencia agrupando por samplingPoint
+tse_list <- splitOn(tse, by = "samples", group = "samplingPoint")
+
+# Añadimos prevalencia y filtramos dentro de cada grupo (prevalence 0.5, detection 0.001)
+tse_list <- lapply(tse_list, addPrevalence, as.relative = TRUE)
+
+m30 <- tse_list[[1]]
+m30s <- agglomerateByPrevalence(m30, rank = "Genus", prevalence = 0.5, detection = 0.001, as.relative = TRUE)
+
+m35 <- tse_list[[2]]
+m35s <- agglomerateByPrevalence(m35, rank = "Genus", prevalence = 0.5, detection = 0.001, as.relative = TRUE)
+
+m65 <- tse_list[[3]]
+m65s <- agglomerateByPrevalence(m65, rank = "Genus", prevalence = 0.5, detection = 0.001, as.relative = TRUE)
+
+# Reunir (merge) los tres conjuntos filtrados y convertir a relabundance
+tse_prevalent <- mergeSEs(list(m30s, m35s), missing.values = 0, join = "full")
+tse_prevalent <- mergeSEs(list(tse_prevalent, m65s), missing.values = 0, join = "full")
+tse_prevalent <- transformAssay(tse_prevalent, method = "relabundance")
+
+# Exportar resultados filtrados por prevalencia (file para anexo)
+write.table(assay(tse_prevalent, "relabundance"),
+            file = "generosFiltradosPorPrevalencia_001porciento.txt",
+            sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+
+# Plots de prevalencia / abundancia (diagnóstico de filtros)
+plotHistogram(tse, row.var = "prevalence")
+plotPrevalence(tse, as.relative = TRUE)
+p1 <- plotPrevalentAbundance(tse, as.relative = TRUE)
+p2 <- plotRowPrevalence(tse, as.relative = TRUE) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+p1 + p2
+
+
+##############################################################################
+# 22. Preparar muestras pareadas para DESeq2 (comparación F vs S)
+##############################################################################
+
+library(TreeSummarizedExperiment)
+library(tibble)
+library(dplyr)
+
+# Convertir colData a tibble
+sample_info <- colData(tse_prevalent) %>% as_tibble()
+
+# Identificar combinaciones (cow + samplingPoint) que tengan ambas técnicas (S y F)
+paired_samples <- sample_info %>%
+  group_by(cow, samplingPoint) %>%
+  filter(all(c("S", "F") %in% samplingDevice)) %>%
+  ungroup()
+
+# Filtrar el TSE para quedarnos sólo con esas muestras pareadas
+tse_paired <- tse_prevalent[, colnames(tse_prevalent) %in% paired_samples$sample]
+
+# Si conoces el orden y quieres dividir en pares (usar con cuidado)
+pares   <- seq(from = 2, to = 32, by = 2)
+impares <- seq(from = 1, to = 32, by = 2)
+
+sonda  <- tse_paired[, pares]    # asumiendo orden establecido
+fistula <- tse_paired[, impares] # asumiendo orden establecido
+
+
+##############################################################################
+# 23. Correlación entre Sonda vs Fístula (por pares, a nivel de géneros)
+##############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# Matrices de abundancia relativa de 'sonda' y 'fistula' (asumiendo ya aglomerado a género)
+mat_sonda   <- assay(sonda, "relabundance")
+mat_fistula <- assay(fistula, "relabundance")
+
+# Chequeos
+stopifnot(identical(rownames(mat_sonda), rownames(mat_fistula)))
+stopifnot(identical(colnames(mat_sonda), colnames(mat_fistula)))
+
+# Metadatos (usamos rownames como ID para evitar duplicados)
+meta <- as.data.frame(colData(sonda)) %>% tibble::rownames_to_column("ID")
+
+# Correlación por par (misma columna: sonda[,i] vs fistula[,i])
+corr_pairs <- {
+  ids <- colnames(mat_sonda)
+  res_list <- vector("list", length(ids))
+
+  for (i in seq_along(ids)) {
+    id <- ids[i]
+    x  <- mat_sonda[, i]
+    y  <- mat_fistula[, i]
+
+    # Filtramos features ausentes en ambas muestras
+    keep <- (x > 0 | y > 0)
+    x <- x[keep]; y <- y[keep]
+
+    # Si hay <3 features, no calculamos correlación (insuficiente)
+    if (length(x) < 3L) {
+      res_list[[i]] <- data.frame(
+        ID = id,
+        samplingPoint = meta$samplingPoint[match(id, meta$ID)],
+        n_features = length(x),
+        pearson_r = NA_real_,
+        spearman_r = NA_real_
+      )
+    } else {
+      res_list[[i]] <- data.frame(
+        ID = id,
+        samplingPoint = meta$samplingPoint[match(id, meta$ID)],
+        n_features = length(x),
+        pearson_r  = suppressWarnings(cor(x, y, method = "pearson")),
+        spearman_r = suppressWarnings(cor(x, y, method = "spearman"))
+      )
+    }
+  }
+  dplyr::bind_rows(res_list)
+}
+
+# Tabla larga y resúmenes por tiempo y global
+corr_long <- corr_pairs %>%
+  pivot_longer(cols = c(pearson_r, spearman_r),
+               names_to = "method", values_to = "r")
+
+summary_by_time <- corr_long %>%
+  group_by(samplingPoint, method) %>%
+  summarise(
+    n_pairs  = sum(!is.na(r)),
+    mean_r   = mean(r, na.rm = TRUE),
+    sd_r     = sd(r,   na.rm = TRUE),
+    median_r = median(r, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_all <- corr_long %>%
+  group_by(method) %>%
+  summarise(
+    n_pairs  = sum(!is.na(r)),
+    mean_r   = mean(r, na.rm = TRUE),
+    sd_r     = sd(r,   na.rm = TRUE),
+    median_r = median(r, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(samplingPoint = "ALL") %>%
+  relocate(samplingPoint)
+
+corr_summary <- bind_rows(summary_by_time, summary_all) %>%
+  arrange(method, samplingPoint)
+
+# Gráficos: scatter global, violin de r por tiempo y scatter facetado por tiempo
+df_scatter_global <- data.frame(
+  Sonda   = as.vector(mat_sonda),
+  Fistula = as.vector(mat_fistula)
+)
+
+gg_global <- ggplot(df_scatter_global, aes(Sonda, Fistula)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  theme_minimal() +
+  labs(
+    title = "Correlación global Sonda vs Fístula (Géneros)",
+    subtitle = paste0(
+      "Pearson r = ", round(cor(df_scatter_global$Sonda, df_scatter_global$Fistula, method = "pearson"), 3),
+      " | Spearman r = ", round(cor(df_scatter_global$Sonda, df_scatter_global$Fistula, method = "spearman"), 3)
+    ),
+    x = "Sonda (relabundance)", y = "Fístula (relabundance)"
+  )
+
+gg_r_by_time <- ggplot(corr_long, aes(x = samplingPoint, y = r, fill = method)) +
+  geom_violin(trim = FALSE, alpha = 0.35) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, position = position_dodge(width = 0.9)) +
+  theme_minimal() +
+  labs(title = "Correlación Sonda vs Fístula por momento",
+       x = "Momento (samplingPoint)", y = "r (correlación)") +
+  scale_fill_discrete(name = "Método", labels = c("pearson_r" = "Pearson", "spearman_r" = "Spearman"))
+
+df_scatter_facet <- data.frame(
+  Sonda   = as.vector(mat_sonda),
+  Fistula = as.vector(mat_fistula),
+  ID      = rep(colnames(mat_sonda), each = nrow(mat_sonda))
+) %>%
+  left_join(meta, by = c("ID" = "ID"))
+
+gg_facet <- ggplot(df_scatter_facet, aes(x = Sonda, y = Fistula)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ samplingPoint) +
+  theme_minimal() +
+  labs(title = "Correlación Sonda vs Fístula separada por momento",
+       x = "Sonda (relabundance)", y = "Fístula (relabundance)")
+
+# Mostrar y exportar resultados
+print(corr_pairs)
+print(corr_summary)
+gg_global
+gg_r_by_time
+gg_facet
+
+write.table(corr_pairs,   "correlaciones_pares_generos.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(corr_summary, "correlaciones_resumen_generos.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+##############################################################################
+# 24. Abundancia diferencial con DESeq2 (pareado F vs S)
+##############################################################################
+
+m30 <- tse_list[[1]]
+m30s <- subsetByPrevalent(m30, prevalence = 0.2, detection = 0.0001, as.relative = TRUE)
+
+m35 <- tse_list[[2]]
+m35s <- subsetByPrevalent(m35, prevalence = 0.2, detection = 0.0001, as.relative = TRUE)
+
+m65 <- tse_list[[3]]
+m65s <- subsetByPrevalent(m65, prevalence = 0.2, detection = 0.0001, as.relative = TRUE)
+
+tse_prevalent <- mergeSEs(list(m30s, m35s), missing.values = 0, join = "full")
+tse_prevalent <- mergeSEs(list(tse_prevalent, m65s), missing.values = 0, join = "full")
+tse_prevalent <- transformAssay(tse_prevalent, method = "relabundance")
+
+library(DESeq2)
+
+# Preparar factores para DESeq2 (pareado)
+colData(tse_paired)$samplingPoint <- as.factor(colData(tse_paired)$samplingPoint)
+colData(tse_paired)$samplingDevice <- relevel(as.factor(colData(tse_paired)$samplingDevice), ref = "S")
+
+# Crear DESeqDataSet a partir del TSE pareado
+dds <- DESeqDataSet(tse_paired, design = ~ cow + samplingPoint + samplingDevice)
+
+# Ajustar modelo
+dds <- DESeq(dds)
+
+# Comparar F vs S (contraste)
+res <- results(dds, contrast = c("samplingDevice", "F", "S"))
+
+# Shrink de log-fold changes (ashr)
+res_shrunk <- lfcShrink(dds, coef = "samplingDevice_F_vs_S", type = "ashr")
+
+# Ordenar y exportar resultados
+res_ordered <- res_shrunk[order(res_shrunk$padj), ]
+head(res_ordered)
+write.table(res_ordered, file = "de_analysis.txt", sep = "\t", col.names = TRUE, row.names = TRUE, quote = FALSE)
+
+# MA plot para diagnóstico
+plotMA(res_shrunk, ylim = c(-4, 4), main = "Fístula vs Sonda")
+res_df <- as.data.frame(res_ordered)
+
+# FIN
